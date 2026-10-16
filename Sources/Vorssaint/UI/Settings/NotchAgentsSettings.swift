@@ -9,7 +9,6 @@ struct NotchAgentsSettingsControls: View {
     @ObservedObject private var l10n = L10n.shared
     @ObservedObject private var usage = AgentUsageService.shared
     @AppStorage(DefaultsKey.notchAgentsClaude) private var claude = true
-    @AppStorage(DefaultsKey.notchAgentsClaudeProfiles) private var claudeProfiles = ""
     @AppStorage(DefaultsKey.notchAgentsCodex) private var codex = true
     @AppStorage(DefaultsKey.notchAgentsOpenCode) private var opencode = true
     @AppStorage(DefaultsKey.notchAgentsCopilot) private var copilot = true
@@ -50,7 +49,6 @@ struct NotchAgentsSettingsControls: View {
             providerRow(.codex, isOn: $codex)
             providerRow(.opencode, isOn: $opencode)
             providerRow(.copilot, isOn: $copilot)
-            if claude { ClaudeAccountsSettings() }
             if codex { CodexAccountsSettings() }
 
             Divider()
@@ -70,7 +68,7 @@ struct NotchAgentsSettingsControls: View {
                 }
             }
             Text(text.cardsHint).font(.caption).foregroundStyle(.secondary)
-            // Banked resets also ask Codex for the account, said where chosen.
+            // The card that makes Codex ask the default account, said where it is chosen.
             if codex, cardBinding(.resets).wrappedValue {
                 Text(text.resetsHelp).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -136,12 +134,13 @@ struct NotchAgentsSettingsControls: View {
                 Toggle(text.priceUpdates, isOn: $priceUpdates).labelsHidden().toggleStyle(.switch)
             }
 
-            if claude, ClaudeAccountProfile.decode(claudeProfiles).isEmpty {
+            if claude {
                 Divider()
                 Text(text.claudeLimitsTitle).font(.subheadline.weight(.medium))
                 TimelineView(.periodic(from: .now, by: 30)) { context in
                     claudeLimitsStatus(now: context.date)
                 }
+                if usage.claudeAccountChecking { ProgressView().controlSize(.small) }
                 Text(text.claudeLimitsPrivacy).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -169,9 +168,16 @@ struct NotchAgentsSettingsControls: View {
     /// Where Claude's plan limits stand, and the one step that brings them
     /// here when they are missing or old.
     @ViewBuilder private func claudeLimitsStatus(now: Date) -> some View {
-        let checked = usage.claudeAppChecked ?? claudeAppFileCheck
+        let account = usage.snapshot.limits[.claude].flatMap { $0.source == .account ? $0.observedAt : nil }
+        let checked = account ?? usage.claudeAppChecked ?? claudeAppFileCheck
         HStack(alignment: .top, spacing: 10) {
-            if let checked, now.timeIntervalSince(checked) < AgentClaudeAppUsage.freshness {
+            if let account {
+                Image(systemName: now.timeIntervalSince(account) < AgentClaudeAppUsage.freshness
+                      ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    .foregroundStyle(now.timeIntervalSince(account) < AgentClaudeAppUsage.freshness ? .green : .orange)
+                Text("Claude Code · " + text.updated(relative(account, now: now)))
+                Spacer(minLength: 0)
+            } else if let checked, now.timeIntervalSince(checked) < AgentClaudeAppUsage.freshness {
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                 Text(text.claudeLimitsCurrent(relative(checked, now: now)))
                 Spacer(minLength: 0)

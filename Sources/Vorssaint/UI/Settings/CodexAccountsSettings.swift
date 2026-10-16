@@ -4,13 +4,16 @@
 import AppKit
 import SwiftUI
 
+/// The Codex homes that get limits cards of their own on the AI page.
 struct CodexAccountsSettings: View {
     @AppStorage(DefaultsKey.notchAgentsCodexProfiles) private var saved = ""
+    /// Hiding the Limits card stops the checks, so Check limits greys out with it.
+    @AppStorage(DefaultsKey.notchAgentsHiddenCards) private var hiddenCards = ""
     @ObservedObject private var service = CodexProfileLimitsService.shared
     @ObservedObject private var l10n = L10n.shared
     @State private var invalidFolder = false
     private var profiles: [CodexAccountProfile] { CodexAccountProfile.decode(saved) }
-    private var text: CodexAccountStrings { .localized(l10n.language) }
+    private var text: CodexAccountStrings { FeatureStrings.codexAccounts(l10n.language) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -26,7 +29,8 @@ struct CodexAccountsSettings: View {
                                 guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
                                 var updated = profiles
                                 if let index = updated.firstIndex(where: { $0.id == profile.id }) {
-                                    updated[index].name = String(value.prefix(40)); save(updated)
+                                    updated[index].name = String(value.prefix(40))
+                                    save(updated)
                                 }
                             }))
                         .textFieldStyle(.roundedBorder)
@@ -35,34 +39,29 @@ struct CodexAccountsSettings: View {
                             .truncationMode(.middle).help(profile.directory)
                     }
                     Button { save(profiles.filter { $0.id != profile.id }) } label: { Image(systemName: "minus.circle") }
-                        .buttonStyle(.plain).help(text.remove)
+                        .buttonStyle(.plain).help(text.remove).accessibilityLabel(text.remove)
                 }
             }
             HStack {
                 Button(text.find) {
                     var updated = profiles
-                    for profile in CodexAccountProfile.discover() where !updated.contains(where: {
+                    for profile in CodexAccountProfile.discover(defaultName: text.defaultName) where !updated.contains(where: {
                         $0.canonicalDirectory == profile.canonicalDirectory
                     }) { updated.append(profile) }
-                    save(Array(updated.prefix(8)))
+                    save(Array(updated.prefix(CodexAccountProfile.maximum)))
                 }
+                .disabled(profiles.count >= CodexAccountProfile.maximum)
                 Button(text.add) { addFolder() }
-                    .disabled(profiles.count >= 8)
+                    .disabled(profiles.count >= CodexAccountProfile.maximum)
                 if !profiles.isEmpty {
                     Button(text.check) { service.refresh(force: true) }
-                        .disabled(service.states.contains(where: \.checking))
+                        .disabled(!service.isEnabled || service.states.allSatisfy(\.checking))
                 }
             }
-            if profiles.isEmpty {
-                Text(text.fallback)
-                    .font(.caption).foregroundStyle(.secondary)
-            } else {
-                Text(text.resetsNote)
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
+            Text(profiles.isEmpty ? text.fallback : text.resetsNote)
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         .onAppear { service.synchronize() }
-        .onChange(of: saved) { _, _ in service.synchronize() }
         .alert(text.chooseFolder, isPresented: $invalidFolder) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -77,13 +76,15 @@ struct CodexAccountsSettings: View {
 
     private func addFolder() {
         let panel = NSOpenPanel()
-        panel.canChooseFiles = false; panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false; panel.showsHiddenFiles = true
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
         panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let name = url.lastPathComponent == ".codex" ? "Default"
-            : url.lastPathComponent.replacingOccurrences(of: ".codex-", with: "").capitalized
-        let profile = CodexAccountProfile(id: UUID().uuidString, name: String(name.prefix(40)), directory: url.path)
+        let profile = CodexAccountProfile(id: UUID().uuidString,
+                                          name: CodexAccountProfile.name(for: url, defaultName: text.defaultName),
+                                          directory: url.path)
         guard let canonical = profile.canonicalDirectory else { invalidFolder = true; return }
         guard !profiles.contains(where: { $0.canonicalDirectory == canonical }) else { return }
         save(profiles + [CodexAccountProfile(id: profile.id, name: profile.name, directory: canonical.path)])

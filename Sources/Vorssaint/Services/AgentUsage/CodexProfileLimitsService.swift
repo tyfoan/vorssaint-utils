@@ -9,8 +9,10 @@ struct CodexProfileLimitsState: Equatable, Identifiable {
     var profile: CodexAccountProfile
     var limits: AgentLimits?
     var plan: String?
+    /// Waiting for its turn or being checked.
     var checking = false
-    var error: String?
+    var failure: CodexAccountUsageError?
+    /// When the last check began; nil until one has.
     var attempted: Date?
     var id: String { profile.id }
 
@@ -20,136 +22,207 @@ struct CodexProfileLimitsState: Equatable, Identifiable {
         limits.windows.removeAll { $0.resetsAt.map { $0 <= now } ?? false }
         return limits.windows.isEmpty ? nil : limits
     }
+
+    func isDue(at now: Date) -> Bool {
+        guard let attempted else { return true }
+        // Only a window that renewed after the reading asks sooner, so a
+        // Codex that answers with a past renewal is not asked every minute.
+        let renewed = limits.map { reading in
+            reading.windows.contains { $0.resetsAt.map { $0 > reading.observedAt && $0 <= now } ?? false }
+        } ?? false
+        return now.timeIntervalSince(attempted) >= CodexAccountUsageReader.interval(after: failure, renewed: renewed)
+    }
 }
 
-/// Account readings never enter the provider-wide log snapshot. Each home
-/// keeps its own limits, errors and refresh time, only while the page is open.
+/// The limits of each Codex home the person added, kept apart from the
+/// provider-wide reading of the logs and in memory only. One home is checked
+/// at a time: when the AI page shows them and they are due, or when a card
+/// or Settings asks, and never while the island is away or Codex is off.
 final class CodexProfileLimitsService: ObservableObject {
-    typealias Reader = (CodexAccountProfile, BoundedProcessCancellation) throws -> (limits: AgentLimits, plan: String?)
+    typealias Reader = (CodexAccountProfile, _ searchPath: String?, BoundedProcessCancellation)
+        -> Result<CodexAccountReading, CodexAccountUsageError>
     static let shared = CodexProfileLimitsService()
+
     @Published private(set) var states: [CodexProfileLimitsState] = []
+    /// Asks the due homes again while the page shows any; nil otherwise.
+    private(set) var timer: Timer?
+
     private let queue = DispatchQueue(label: "com.vorssaint.codex-profile-limits", qos: .utility)
     private let defaults: UserDefaults
     private let reader: Reader?
-    private var cancellation = BoundedProcessCancellation()
-    private var generation = 0
-    private var timer: Timer?
+    private let loginShellPath: () -> String?
+    private var running: (id: String, cancellation: BoundedProcessCancellation)?
+    /// Checks waiting their turn. Those the person asked for still run after
+    /// the page closes; the page's own wait for it to show again.
+    private var waiting: [(id: String, asked: Bool)] = []
     private var visible = false
-    private var inFlight = false
+    /// A Terminal window's PATH, asked of the login shell only when the
+    /// person checks again for a Codex that was not found, as on the Resets
+    /// card: that runs their shell's startup files.
+    private var shellPath: String?
 
-    init(defaults: UserDefaults = .standard, reader: Reader? = nil) {
+    init(defaults: UserDefaults = .standard, reader: Reader? = nil,
+         loginShellPath: @escaping () -> String? = AgentCodexServer.loginShellPath) {
         self.defaults = defaults
         self.reader = reader
+        self.loginShellPath = loginShellPath
     }
 
-    private var enabled: Bool {
-        NotchAgentSupport.isEnabled(in: defaults) && defaults.bool(forKey: DefaultsKey.notchAgentsCodex)
+    /// Only while an account card can show: a hidden Limits card asks nothing.
+    var isEnabled: Bool {
+        NotchAgentSupport.isEnabled(in: defaults) && NotchAgentSupport.showsCodexAccounts(in: defaults)
     }
 
+    /// Follows the saved homes and whether Codex is on. Asks only what is
+    /// due, and only while the page shows.
     func synchronize() {
-        if !enabled { pause() }
+        if !isEnabled { cancelChecks() }
         let wanted = CodexAccountProfile.decode(defaults.string(forKey: DefaultsKey.notchAgentsCodexProfiles) ?? "")
-        guard states.map(\.profile) != wanted else { return }
-        let wasVisible = visible
-        pause()
-        states = wanted.map { profile in
-            if var previous = states.first(where: { $0.id == profile.id && $0.profile.directory == profile.directory }) {
-                previous.profile = profile; previous.checking = false
-                return previous
+        if states.map(\.profile) != wanted {
+            let previous = states
+            states = wanted.map { profile in
+                // A renamed home keeps its reading and its check.
+                guard var state = previous.first(where: { $0.id == profile.id && $0.profile.directory == profile.directory })
+                else { return CodexProfileLimitsState(profile: profile) }
+                state.profile = profile
+                return state
             }
-            return CodexProfileLimitsState(profile: profile)
+            let kept = Set(states.filter(\.checking).map(\.id))
+            waiting.removeAll { !kept.contains($0.id) }
+            if let running, !kept.contains(running.id) {
+                running.cancellation.cancel()
+                self.running = nil
+                startNext()
+            }
         }
-        if wasVisible { pageDidAppear() }
+        syncTimer()
+        if visible { refresh() }
     }
 
-    func pageDidAppear() {
+    /// A Settings preview shows what is known without asking.
+    func pageDidAppear(preview: Bool = false) {
+        if !preview { visible = true }
         synchronize()
-        guard enabled else { return }
-        visible = true
-        refresh()
-        timer?.invalidate()
+    }
+
+    /// A check under way finishes and keeps its time, so looking at the page
+    /// again does not start it over.
+    func pageDidDisappear() {
+        visible = false
+        syncTimer()
+        let dropped = Set(waiting.filter { !$0.asked }.map(\.id))
+        guard !dropped.isEmpty else { return }
+        waiting.removeAll { !$0.asked }
+        for index in states.indices where dropped.contains(states[index].id) { states[index].checking = false }
+    }
+
+    /// The island is away, the section stops or Codex is off: nothing runs.
+    func pause() {
+        visible = false
+        cancelChecks()
+        syncTimer()
+    }
+
+    /// Queues the homes that are due, or, when the person asks, `id` or every
+    /// home. One already waiting or under way is not asked twice.
+    func refresh(id: String? = nil, force: Bool = false, now: Date = Date()) {
+        guard isEnabled, visible || force else { return }
+        for index in states.indices where id == nil || states[index].id == id {
+            let state = states[index]
+            if state.checking {
+                if force, let place = waiting.firstIndex(where: { $0.id == state.id }) { waiting[place].asked = true }
+                continue
+            }
+            guard force || state.isDue(at: now) else { continue }
+            states[index].checking = true
+            waiting.append((state.id, force))
+        }
+        startNext()
+    }
+
+    private func startNext() {
+        guard running == nil, !waiting.isEmpty else { return }
+        let next = waiting.removeFirst()
+        guard let index = states.firstIndex(where: { $0.id == next.id }) else { return startNext() }
+        let profile = states[index].profile
+        let searching = next.asked && states[index].failure == .missingCLI && shellPath == nil
+        states[index].attempted = Date()
+        let cancellation = BoundedProcessCancellation()
+        running = (next.id, cancellation)
+        let known = shellPath, shell = loginShellPath
+        let read = reader ?? Self.reader(apps: Self.apps())
+        queue.async { [weak self] in
+            let path = searching ? shell() : known
+            let result = read(profile, path, cancellation)
+            DispatchQueue.main.async {
+                guard let self, self.running?.cancellation === cancellation else { return }
+                self.running = nil
+                if let path { self.shellPath = path }
+                self.finish(profile, result)
+                self.startNext()
+            }
+        }
+    }
+
+    private func finish(_ profile: CodexAccountProfile, _ result: Result<CodexAccountReading, CodexAccountUsageError>) {
+        guard let index = states.firstIndex(where: { $0.id == profile.id && $0.profile.directory == profile.directory })
+        else { return }
+        var state = states[index]
+        state.checking = false
+        switch result {
+        case .success(let reading):
+            state.limits = reading.limits
+            state.plan = reading.plan
+            state.failure = nil
+        case .failure(.cancelled):
+            state.attempted = nil
+        case .failure(let failure):
+            // Another sign-in may be behind the home now. A check that could
+            // not finish leaves the last reading standing.
+            if failure == .needsSignIn || failure == .invalidProfile {
+                state.limits = nil
+                state.plan = nil
+            }
+            state.failure = failure
+        }
+        states[index] = state
+    }
+
+    private func cancelChecks() {
+        guard running != nil || !waiting.isEmpty else { return }
+        if let running {
+            running.cancellation.cancel()
+            // Asked again once checks can run.
+            if let index = states.firstIndex(where: { $0.id == running.id }) { states[index].attempted = nil }
+        }
+        running = nil
+        waiting.removeAll()
+        for index in states.indices where states[index].checking { states[index].checking = false }
+    }
+
+    private func syncTimer() {
+        guard visible, isEnabled, !states.isEmpty else {
+            timer?.invalidate()
+            timer = nil
+            return
+        }
+        guard timer == nil else { return }
         let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
         timer.tolerance = 5
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
     }
 
-    func pause() {
-        visible = false
-        timer?.invalidate(); timer = nil
-        cancellation.cancel(); generation += 1; inFlight = false
-        for index in states.indices {
-            if states[index].checking { states[index].attempted = nil }
-            states[index].checking = false
+    private static func reader(apps: [URL]) -> Reader {
+        { profile, searchPath, cancellation in
+            guard let executable = AgentCodexServer.executable(apps: apps, home: FileManager.default.homeDirectoryForCurrentUser,
+                                                               searchPath: searchPath) else { return .failure(.missingCLI) }
+            return CodexAccountUsageReader.read(profile, executable: executable, searchPath: searchPath,
+                                                cancellation: cancellation)
         }
     }
 
-    func refresh(id: String? = nil, force: Bool = false) {
-        guard enabled, !inFlight, visible || force else { return }
-        let now = Date()
-        let requested = states.filter {
-            let renewed = $0.limits?.windows.contains { ($0.resetsAt ?? .distantFuture) <= now } == true
-            let interval: TimeInterval = $0.error == nil ? (renewed ? 30 : CodexAccountUsageReader.refreshInterval) : 60
-            return (id == nil || $0.id == id) && (force || now.timeIntervalSince($0.attempted ?? .distantPast) >= interval)
-        }.map(\.profile)
-        guard !requested.isEmpty else { return }
-        inFlight = true
-        cancellation = BoundedProcessCancellation()
-        let token = cancellation, currentGeneration = generation
-        for index in states.indices where requested.contains(states[index].profile) {
-            states[index].checking = true; states[index].attempted = now
-        }
-        let apps = reader == nil ? AgentCodexServer.appIdentifiers.flatMap {
-            NSWorkspace.shared.urlsForApplications(withBundleIdentifier: $0)
-        } : []
-        let read = reader
-        queue.async { [weak self] in
-            for profile in requested {
-                if token.isCancelled { break }
-                let result: Result<(limits: AgentLimits, plan: String?), Error>
-                do {
-                    if let read { result = .success(try read(profile, token)) }
-                    else {
-                        guard let executable = CodexAccountUsageReader.executable(apps: apps) else {
-                            throw CodexAccountUsageError.missingCLI
-                        }
-                        result = .success(try CodexAccountUsageReader.read(profile, executable: executable, cancellation: token))
-                    }
-                } catch { result = .failure(error) }
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.generation == currentGeneration, !token.isCancelled,
-                          let index = self.states.firstIndex(where: { $0.profile == profile }) else { return }
-                    self.states[index].checking = false
-                    switch result {
-                    case .success(let reading):
-                        self.states[index].limits = reading.limits; self.states[index].plan = reading.plan
-                        self.states[index].error = nil
-                    case .failure(let error):
-                        if (error as? AgentCodexServer.Failure) == .needsSignIn
-                            || (error as? CodexAccountUsageError) == .invalidProfile {
-                            self.states[index].limits = nil; self.states[index].plan = nil
-                        }
-                        self.states[index].error = Self.message(error)
-                    }
-                }
-            }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.generation == currentGeneration else { return }
-                self.inFlight = false
-            }
-        }
-    }
-
-    private static func message(_ error: Error) -> String {
-        let language = L10n.shared.language
-        let text = CodexAccountStrings.localized(language)
-        switch error {
-        case CodexAccountUsageError.missingCLI: return FeatureStrings.notchAgents(language).resetsNeedCodex
-        case CodexAccountUsageError.invalidProfile: return text.chooseFolder
-        case AgentCodexServer.Failure.needsSignIn: return text.signIn
-        case AgentCodexServer.Failure.outdated: return text.update
-        case CodexAccountUsageError.cancelled: return text.cancelled
-        default: return text.failed
-        }
+    private static func apps() -> [URL] {
+        AgentCodexServer.appIdentifiers.flatMap { NSWorkspace.shared.urlsForApplications(withBundleIdentifier: $0) }
     }
 }
